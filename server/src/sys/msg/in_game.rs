@@ -1,6 +1,12 @@
 #[cfg(feature = "persistent_world")]
 use crate::TerrainPersistence;
-use crate::{EditableSettings, Settings, client::Client, plots::may_build_at};
+use crate::{
+    EditableSettings, Settings,
+    build_persistence::BuildPersistence,
+    client::Client,
+    events::{PlotBuildAction, PlotBuildEvent},
+    plots::{self, may_build_at},
+};
 use common::{
     comp::{
         Admin, AdminRole, Body, CanBuild, ControlEvent, Controller, ForceUpdate, Health, Ori,
@@ -51,6 +57,7 @@ event_emitters! {
         update_map_marker: event::UpdateMapMarkerEvent,
         client_disconnect: event::ClientDisconnectEvent,
         set_battle_mode: event::SetBattleModeEvent,
+        plot_build: PlotBuildEvent,
     }
 }
 
@@ -74,6 +81,7 @@ impl Sys {
         controller: Option<&mut Controller>,
         settings: &Read<'_, Settings>,
         build_areas: &Read<'_, AreasContainer<BuildArea>>,
+        build_persistence: Option<&BuildPersistence>,
         player_physics_setting: Option<&mut PlayerPhysicsSetting>,
         server_physics_forced: bool,
         maybe_admin: &Option<&Admin>,
@@ -157,6 +165,28 @@ impl Sys {
                 {
                     *player_physics = Some((pos, vel, ori));
                 }
+            },
+            ClientGeneral::BreakBlock(pos)
+                if can_build.get(entity).is_some_and(|comp_can_build| {
+                    comp_can_build.enabled && may_build_at(comp_can_build, build_areas, pos)
+                }) && pays_for_building(maybe_admin, build_persistence, build_areas, pos) =>
+            {
+                emitters.emit(PlotBuildEvent {
+                    entity,
+                    pos,
+                    action: PlotBuildAction::Remove,
+                });
+            },
+            ClientGeneral::PlaceBlock(pos, new_block)
+                if can_build.get(entity).is_some_and(|comp_can_build| {
+                    comp_can_build.enabled && may_build_at(comp_can_build, build_areas, pos)
+                }) && pays_for_building(maybe_admin, build_persistence, build_areas, pos) =>
+            {
+                emitters.emit(PlotBuildEvent {
+                    entity,
+                    pos,
+                    action: PlotBuildAction::Place(new_block),
+                });
             },
             ClientGeneral::BreakBlock(pos) => {
                 if let Some(comp_can_build) = can_build.get(entity)
@@ -267,6 +297,20 @@ impl Sys {
 /// This system will handle new messages from clients
 #[derive(Default)]
 pub struct Sys;
+/// Whether building at `pos` costs materials: non-admin players pay inside
+/// claimed plots, everywhere else building stays free.
+fn pays_for_building(
+    maybe_admin: &Option<&Admin>,
+    build_persistence: Option<&BuildPersistence>,
+    build_areas: &AreasContainer<BuildArea>,
+    pos: Vec3<i32>,
+) -> bool {
+    maybe_admin.is_none()
+        && build_persistence.is_some_and(|build_persistence| {
+            plots::plot_at(pos, build_areas, build_persistence).is_some()
+        })
+}
+
 impl<'a> System<'a> for Sys {
     type SystemData = (
         Entities<'a>,
@@ -281,6 +325,7 @@ impl<'a> System<'a> for Sys {
             Read<'a, DeltaTime>,
             Read<'a, Settings>,
             Read<'a, AreasContainer<BuildArea>>,
+            Option<Read<'a, BuildPersistence>>,
         ),
         ReadStorage<'a, CanBuild>,
         WriteStorage<'a, ForceUpdate>,
@@ -314,7 +359,7 @@ impl<'a> System<'a> for Sys {
             entities,
             events,
             (terrain, slow_jobs, editable_settings),
-            (id_maps, dt, settings, build_areas),
+            (id_maps, dt, settings, build_areas, build_persistence),
             can_build,
             mut force_updates,
             is_rider,
@@ -412,6 +457,7 @@ impl<'a> System<'a> for Sys {
                             controller.as_deref_mut(),
                             &settings,
                             &build_areas,
+                            build_persistence.as_deref(),
                             new_player_physics_setting.as_mut(),
                             is_server_physics_forced,
                             &maybe_admin,
@@ -598,5 +644,59 @@ impl<'a> System<'a> for Sys {
         slow_jobs.spawn("CHUNK_DROP", move || {
             drop(deferred_updates);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use authc::Uuid;
+
+    #[test]
+    fn only_players_building_in_plots_pay() {
+        let dir = std::env::temp_dir().join(format!("veloren-in-game-pays-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut build_persistence = BuildPersistence::load(&dir);
+        let mut areas = AreasContainer::<BuildArea>::default();
+        let key = Vec2::new(1, 1);
+        let plot = plots::plot_area(key, 0, 64);
+        areas.insert(plots::plot_name(key), plot).unwrap();
+        build_persistence.plot_claimed(&plots::plot_name(key), plot, Uuid::from_u128(1));
+        areas
+            .insert("event_area".to_owned(), Aabb {
+                min: Vec3::new(500, 500, 0),
+                max: Vec3::new(600, 600, 100),
+            })
+            .unwrap();
+
+        let admin = Admin(AdminRole::Admin);
+        let in_plot = Vec3::new(40, 40, 10);
+        let in_event_area = Vec3::new(550, 550, 10);
+        assert!(pays_for_building(
+            &None,
+            Some(&build_persistence),
+            &areas,
+            in_plot
+        ));
+        // Admins build for free, even in plots
+        assert!(!pays_for_building(
+            &Some(&admin),
+            Some(&build_persistence),
+            &areas,
+            in_plot
+        ));
+        // Build areas handed out by admins stay free
+        assert!(!pays_for_building(
+            &None,
+            Some(&build_persistence),
+            &areas,
+            in_event_area
+        ));
+        // Without plots enabled nothing changes
+        assert!(!pays_for_building(&None, None, &areas, in_plot));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

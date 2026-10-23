@@ -16,6 +16,7 @@ pub use common::event::{
     UpdateCharacterDataEvent, UpdateMapMarkerEvent,
 };
 
+pub use super::building::PlotBuildEvent;
 #[cfg(feature = "plugins")]
 pub use common::event::RequestPluginsEvent;
 
@@ -94,6 +95,7 @@ macro_rules! server_events {
             SummonBeamPillarsEvent
             ArcingEvent
             CreatePoolEvent
+            PlotBuildEvent
         }
 
         #[cfg(feature = "plugins")]

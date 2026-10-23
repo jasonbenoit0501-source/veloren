@@ -30,6 +30,7 @@ use self::{
     trade::handle_process_trade_action,
 };
 
+mod building;
 mod entity_creation;
 mod entity_manipulation;
 mod event_types;
@@ -42,6 +43,7 @@ mod mounting;
 mod player;
 mod trade;
 
+pub(crate) use building::{PlotBuildAction, PlotBuildEvent};
 pub(crate) use event_types::register_event_busses;
 /// Shared utilities used by other code **in this crate**
 pub(crate) mod shared {
@@ -103,6 +105,7 @@ fn event_sys_name<T: ServerEvent>() -> String {
 }
 
 pub fn register_event_systems(builder: &mut DispatcherBuilder) {
+    building::register_event_systems(builder);
     inventory_manip::register_event_systems(builder);
     entity_manipulation::register_event_systems(builder);
     interaction::register_event_systems(builder);

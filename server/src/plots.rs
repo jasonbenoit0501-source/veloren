@@ -13,6 +13,7 @@ use crate::build_persistence::BuildPersistence;
 use authc::Uuid;
 use common::{
     comp::CanBuild,
+    depot::Id,
     terrain::{TerrainChunkSize, TerrainGrid},
     vol::RectVolSize,
 };
@@ -68,17 +69,27 @@ pub fn is_protected(
     areas: &Areas,
     build_persistence: &BuildPersistence,
 ) -> bool {
+    plot_at(pos, areas, build_persistence).is_some()
+        && !builder.is_some_and(|builder| may_build_at(builder, areas, pos))
+}
+
+/// The build area of the claimed plot containing `pos`, if there is one.
+pub fn plot_at(
+    pos: Vec3<i32>,
+    areas: &Areas,
+    build_persistence: &BuildPersistence,
+) -> Option<Id<Aabb<i32>>> {
     if !build_persistence.has_plots() {
-        return false;
+        return None;
     }
     let name = plot_name(TerrainGrid::chunk_key(pos));
-    build_persistence.plot_owner(&name).is_some()
-        && areas
-            .area_metas()
-            .get(&name)
-            .and_then(|id| areas.areas().get(*id))
+    build_persistence.plot_owner(&name)?;
+    areas.area_metas().get(&name).copied().filter(|id| {
+        areas
+            .areas()
+            .get(*id)
             .is_some_and(|aabb| aabb.contains_point(pos))
-        && !builder.is_some_and(|builder| may_build_at(builder, areas, pos))
+    })
 }
 
 /// Whether a plot covering `area` would come within [`SITE_MARGIN`] of any of

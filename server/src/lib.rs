@@ -8,6 +8,7 @@
 
 pub mod automod;
 pub mod build_persistence;
+pub mod building_costs;
 mod character_creator;
 pub mod chat;
 pub mod chunk_generator;
@@ -544,6 +545,9 @@ impl Server {
             build_persistence
                 .restore_areas(&mut state.ecs().write_resource::<AreasContainer<BuildArea>>());
             state.ecs_mut().insert(build_persistence);
+            state
+                .ecs_mut()
+                .insert(building_costs::BuildLedger::load(data_dir));
         }
 
         // Insert the world into the ECS (todo: Maybe not an Arc?)
@@ -1282,6 +1286,10 @@ impl Server {
             .ecs()
             .try_fetch_mut::<TerrainPersistence>()
             .map(|mut t| t.maintain());
+        self.state
+            .ecs()
+            .try_fetch_mut::<building_costs::BuildLedger>()
+            .map(|mut ledger| ledger.maintain());
     }
 
     // Run RegionMap tick to update entity region occupancy
