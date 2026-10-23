@@ -15,18 +15,23 @@ use std::{
     any::{Any, type_name},
     fs::File,
     io::{self, Read as _, Write as _},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
 use vek::*;
 
 const MAX_BLOCK_CACHE: usize = 64_000_000;
 
+/// How often modified chunks that are still loaded get written to disk.
+const SAVE_INTERVAL: Duration = Duration::from_secs(60);
+
 pub struct TerrainPersistence {
     path: PathBuf,
     chunks: HashMap<Vec2<i32>, LoadedChunk>,
     /// A cache of recently unloaded chunks
     cached_chunks: LruMap<Vec2<i32>, Chunk, ByBlockLimiter>,
+    last_save: Instant,
 }
 
 /// Wrapper over a [`Chunk`] that keeps track of modifications
@@ -57,6 +62,7 @@ impl TerrainPersistence {
             path,
             chunks: HashMap::default(),
             cached_chunks: LruMap::new(ByBlockLimiter::new(MAX_BLOCK_CACHE)),
+            last_save: Instant::now(),
         }
     }
 
@@ -89,17 +95,26 @@ impl TerrainPersistence {
     /// Maintain terrain persistence (writing changes changes back to
     /// filesystem, etc.)
     pub fn maintain(&mut self) {
-        // Currently, this does nothing because filesystem writeback occurs on
-        // chunk unload However, this is not a particularly reliable
-        // mechanism (it doesn't survive power loss, say). Later, a more
-        // reliable strategy should be implemented here.
+        // Chunks are also written back when they unload, but a long-lived chunk
+        // (e.g. around a player's base) would otherwise only be saved on a clean
+        // shutdown, so periodically write back everything that changed.
+        if self.last_save.elapsed() >= SAVE_INTERVAL {
+            self.save_modified();
+        }
     }
 
-    fn path_for(&self, key: Vec2<i32>) -> PathBuf {
-        let mut path = self.path.clone();
-        path.push(format!("chunk_{}_{}.dat", key.x, key.y));
-        path
+    /// Write every loaded chunk with unsaved modifications to disk, keeping it
+    /// loaded.
+    pub fn save_modified(&mut self) {
+        self.last_save = Instant::now();
+        for (key, loaded_chunk) in self.chunks.iter_mut().filter(|(_, c)| c.modified) {
+            if write_chunk(&chunk_path(&self.path, *key), &loaded_chunk.chunk) {
+                loaded_chunk.modified = false;
+            }
+        }
     }
+
+    fn path_for(&self, key: Vec2<i32>) -> PathBuf { chunk_path(&self.path, key) }
 
     fn load_chunk(&mut self, key: Vec2<i32>) -> &mut LoadedChunk {
         let path = self.path_for(key);
@@ -171,30 +186,7 @@ impl TerrainPersistence {
                 return;
             }
 
-            if chunk.blocks.is_empty() {
-                let path = self.path_for(key);
-
-                if path.is_file()
-                    && let Err(error) = std::fs::remove_file(&path)
-                {
-                    error!(?error, ?path, "Failed to remove file for empty chunk");
-                }
-            } else {
-                let bytes =
-                    match encode_to_vec::<version::Current, _>(chunk.prepare_raw(), legacy()) {
-                        Err(err) => {
-                            error!("Failed to serialize chunk data: {:?}", err);
-                            return;
-                        },
-                        Ok(bytes) => bytes,
-                    };
-
-                let atomic_file =
-                    AtomicFile::new(self.path_for(key), OverwriteBehavior::AllowOverwrite);
-                if let Err(err) = atomic_file.write(|file| file.write_all(&bytes)) {
-                    error!("Failed to write chunk data to file: {:?}", err);
-                }
-            }
+            write_chunk(&self.path_for(key), &chunk);
         }
     }
 
@@ -225,6 +217,39 @@ impl TerrainPersistence {
             loaded_chunk.modified = true;
         }
     }
+}
+
+fn chunk_path(dir: &Path, key: Vec2<i32>) -> PathBuf {
+    dir.join(format!("chunk_{}_{}.dat", key.x, key.y))
+}
+
+/// Write a chunk's modifications to `path`, removing the file if there are
+/// none. Returns whether this succeeded.
+fn write_chunk(path: &Path, chunk: &Chunk) -> bool {
+    if chunk.blocks.is_empty() {
+        if path.is_file()
+            && let Err(error) = std::fs::remove_file(path)
+        {
+            error!(?error, ?path, "Failed to remove file for empty chunk");
+            return false;
+        }
+        return true;
+    }
+
+    let bytes = match encode_to_vec::<version::Current, _>(chunk.clone().prepare_raw(), legacy()) {
+        Err(err) => {
+            error!("Failed to serialize chunk data: {:?}", err);
+            return false;
+        },
+        Ok(bytes) => bytes,
+    };
+
+    let atomic_file = AtomicFile::new(path, OverwriteBehavior::AllowOverwrite);
+    if let Err(err) = atomic_file.write(|file| file.write_all(&bytes)) {
+        error!("Failed to write chunk data to file: {:?}", err);
+        return false;
+    }
+    true
 }
 
 impl Drop for TerrainPersistence {
@@ -531,6 +556,45 @@ mod tests {
             .blocks()
             .collect::<Vec<_>>();
         assert_eq!(blocks, vec![(Vec3::new(31, 31, 10), Block::empty())]);
+
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn periodic_save_survives_crash() {
+        let dir = test_dir("periodic");
+        let pos = Vec3::new(8, 9, 10);
+        let mut persistence = TerrainPersistence::new(dir.clone());
+        persistence.set_block(pos, wood());
+        persistence.save_modified();
+        assert!(!persistence.chunks[&Vec2::new(0, 0)].modified);
+        // Simulate a crash: the chunk is never unloaded and nothing runs on drop
+        std::mem::forget(persistence);
+
+        let mut persistence = TerrainPersistence::new(dir.clone());
+        let blocks = persistence
+            .load_chunk(Vec2::new(0, 0))
+            .chunk
+            .blocks()
+            .collect::<Vec<_>>();
+        assert_eq!(blocks, vec![(pos, wood())]);
+
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maintain_waits_for_save_interval() {
+        let dir = test_dir("interval");
+        let mut persistence = TerrainPersistence::new(dir.clone());
+        persistence.set_block(Vec3::new(1, 2, 3), wood());
+        persistence.maintain();
+        assert!(!dir.join("terrain/chunk_0_0.dat").exists());
+
+        persistence.last_save -= SAVE_INTERVAL;
+        persistence.maintain();
+        assert!(dir.join("terrain/chunk_0_0.dat").is_file());
 
         drop(persistence);
         let _ = std::fs::remove_dir_all(&dir);

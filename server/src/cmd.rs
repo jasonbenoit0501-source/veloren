@@ -363,6 +363,29 @@ fn area(server: &mut Server, area_name: &str, kind: &str) -> CmdResult<depot::Id
         })
 }
 
+fn player_uuid(server: &Server, entity: EcsEntity) -> Option<Uuid> {
+    server
+        .state
+        .ecs()
+        .read_storage::<comp::Player>()
+        .get(entity)
+        .map(|player| player.uuid())
+}
+
+/// Update the saved build areas and permissions, if they are being saved.
+fn with_build_persistence(
+    server: &Server,
+    f: impl FnOnce(&mut crate::build_persistence::BuildPersistence),
+) {
+    if let Some(mut build_persistence) = server
+        .state
+        .ecs()
+        .try_fetch_mut::<crate::build_persistence::BuildPersistence>(
+    ) {
+        f(&mut build_persistence);
+    }
+}
+
 // Prevent use through sudo.
 fn no_sudo(client: EcsEntity, target: EcsEntity) -> CmdResult<()> {
     if client == target {
@@ -2715,6 +2738,9 @@ fn handle_permit_build(
         });
         comp_can_build.build_areas.insert(bb_id);
         drop(can_build);
+        if let Some(uuid) = player_uuid(server, target) {
+            with_build_persistence(server, |b| b.permit_added(uuid, &area_name));
+        }
         if client != target {
             server.notify_client(
                 target,
@@ -2753,6 +2779,9 @@ fn handle_revoke_build(
         if let Some(mut comp_can_build) = can_build.get_mut(target) {
             comp_can_build.build_areas.retain(|&x| x != bb_id);
             drop(can_build);
+            if let Some(uuid) = player_uuid(server, target) {
+                with_build_persistence(server, |b| b.permit_removed(uuid, &area_name));
+            }
             if client != target {
                 server.notify_client(
                     target,
@@ -2791,6 +2820,9 @@ fn handle_revoke_build_all(
     let ecs = server.state.ecs();
 
     ecs.write_storage::<comp::CanBuild>().remove(target);
+    if let Some(uuid) = player_uuid(server, target) {
+        with_build_persistence(server, |b| b.permits_cleared(uuid));
+    }
     if client != target {
         server.notify_client(
             target,
@@ -2966,14 +2998,19 @@ fn handle_area_add(
             ChatType::CommandInfo,
             Content::Plain(format!("Created {kind} zone {}", area_name)),
         );
+        let aabb = Aabb {
+            min: Vec3::new(xlo, ylo, zlo),
+            max: Vec3::new(xhi, yhi, zhi),
+        }
+        .made_valid();
         special_areas
-            .insert(area_name, Aabb {
-                min: Vec3::new(xlo, ylo, zlo),
-                max: Vec3::new(xhi, yhi, zhi),
-            })
+            .insert(area_name.clone(), aabb)
             .map_err(|area_name| {
                 Content::Plain(format!("{kind} zone {} already exists!", area_name))
             })?;
+        if matches!(AreaKind::from_str(&kind), Ok(AreaKind::Build)) {
+            with_build_persistence(server, |b| b.area_added(&area_name, aabb));
+        }
         server.notify_client(client, msg);
         Ok(())
     } else {
@@ -3039,6 +3076,9 @@ fn handle_area_remove(
                 Content::Plain(format!("No such build area {}", area_name))
             },
         })?;
+        if matches!(AreaKind::from_str(&kind), Ok(AreaKind::Build)) {
+            with_build_persistence(server, |b| b.area_removed(&area_name));
+        }
         server.notify_client(
             client,
             ServerGeneral::server_msg(

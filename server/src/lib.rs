@@ -7,6 +7,7 @@
 #![feature(box_patterns, option_zip, const_type_name, slice_partition_dedup)]
 
 pub mod automod;
+pub mod build_persistence;
 mod character_creator;
 pub mod chat;
 pub mod chunk_generator;
@@ -534,6 +535,14 @@ impl Server {
                 .write_resource::<AreasContainer<BuildArea>>()
                 .insert("world".to_string(), world_aabb)
                 .expect("The initial insert should always work.");
+        }
+
+        // Restore build areas and permissions saved by a previous run
+        if settings.experimental_terrain_persistence {
+            let build_persistence = build_persistence::BuildPersistence::load(data_dir);
+            build_persistence
+                .restore_areas(&mut state.ecs().write_resource::<AreasContainer<BuildArea>>());
+            state.ecs_mut().insert(build_persistence);
         }
 
         // Insert the world into the ECS (todo: Maybe not an Arc?)

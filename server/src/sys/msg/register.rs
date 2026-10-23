@@ -1,5 +1,6 @@
 use crate::{
     EditableSettings, Settings,
+    build_persistence::BuildPersistence,
     client::Client,
     login_provider::{LoginProvider, PendingLogin},
     metrics::PlayerMetrics,
@@ -21,12 +22,13 @@ use common_net::msg::{
     CharacterInfo, ClientRegister, DisconnectReason, PlayerInfo, PlayerListUpdate, RegisterError,
     ServerGeneral, ServerInit, WorldMapMsg, server::ServerDescription,
 };
+use common_state::{AreasContainer, BuildArea};
 use hashbrown::{HashMap, hash_map};
 use itertools::Either;
 use rayon::prelude::*;
 use specs::{
-    Entities, Join, LendJoin, ParJoin, Read, ReadExpect, ReadStorage, SystemData, WriteExpect,
-    WriteStorage, shred,
+    Entities, Join, LazyUpdate, LendJoin, ParJoin, Read, ReadExpect, ReadStorage, SystemData,
+    WriteExpect, WriteStorage, shred,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -52,6 +54,9 @@ pub struct ReadData<'a> {
     #[cfg(feature = "plugins")]
     plugin_mgr: Read<'a, PluginMgr>,
     data_dir: ReadExpect<'a, crate::DataDir>,
+    build_persistence: Option<Read<'a, BuildPersistence>>,
+    build_areas: Read<'a, AreasContainer<BuildArea>>,
+    lazy_update: Read<'a, LazyUpdate>,
 }
 
 /// This system will handle new messages from clients
@@ -462,6 +467,19 @@ impl<'a> System<'a> for Sys {
                         admin: Admin(admin.role.into()),
                         uuid,
                     });
+                }
+
+                // Restore saved build permissions
+                if let Some(build_persistence) = &read_data.build_persistence {
+                    let build_areas =
+                        build_persistence.permitted_areas(uuid, &read_data.build_areas);
+                    if !build_areas.is_empty() {
+                        // CanBuild is also borrowed via TrackedStorages, so defer the insert.
+                        read_data.lazy_update.insert(entity, comp::CanBuild {
+                            enabled: false,
+                            build_areas,
+                        });
+                    }
                 }
                 msg
             })
