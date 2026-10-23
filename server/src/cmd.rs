@@ -200,6 +200,7 @@ fn do_command(
         ServerChatCommand::Outcome => handle_outcome,
         ServerChatCommand::PermitBuild => handle_permit_build,
         ServerChatCommand::Players => handle_players,
+        ServerChatCommand::Plot => handle_plot,
         ServerChatCommand::Poise => handle_poise,
         ServerChatCommand::Portal => handle_spawn_portal,
         ServerChatCommand::ResetRecipes => handle_reset_recipes,
@@ -2840,6 +2841,234 @@ fn handle_revoke_build_all(
         ),
     );
     Ok(())
+}
+
+fn handle_plot(
+    server: &mut Server,
+    client: EcsEntity,
+    target: EcsEntity,
+    args: Vec<String>,
+    action: &ServerChatCommand,
+) -> CmdResult<()> {
+    use crate::{build_persistence::BuildPersistence, plots};
+
+    no_sudo(client, target)?;
+    let (Some(plot_action), player_name) = parse_cmd_args!(args, String, String) else {
+        return Err(action.help_content());
+    };
+    if server.state.ecs().try_fetch::<BuildPersistence>().is_none() {
+        return Err(Content::Plain(
+            "Building plots are not enabled on this server.".to_owned(),
+        ));
+    }
+    let owner = uuid(server, target, "target")?;
+    let pos = position(server, target, "target")?;
+    let chunk_key = server.state.terrain().pos_key(pos.0.as_());
+    let name = plots::plot_name(chunk_key);
+
+    // The id of the plot you are standing in, if you own it.
+    let own_plot_here = |server: &Server| -> CmdResult<depot::Id<Aabb<i32>>> {
+        let ecs = server.state.ecs();
+        match ecs.read_resource::<BuildPersistence>().plot_owner(&name) {
+            Some(plot_owner) if plot_owner == owner => {},
+            Some(_) => {
+                return Err(Content::Plain(
+                    "This plot belongs to someone else.".to_owned(),
+                ));
+            },
+            None => return Err(Content::Plain("You are not standing in a plot.".to_owned())),
+        }
+        ecs.read_resource::<AreasContainer<BuildArea>>()
+            .area_metas()
+            .get(&name)
+            .copied()
+            .ok_or_else(|| Content::Plain("You are not standing in a plot.".to_owned()))
+    };
+
+    let msg = match plot_action.as_str() {
+        "claim" => {
+            let (max_plots, height) = {
+                let settings = server.settings();
+                (
+                    settings.gameplay.max_plots_per_player,
+                    settings.gameplay.plot_height,
+                )
+            };
+            match server.state.terrain().get_key(chunk_key) {
+                None => {
+                    return Err(Content::Plain(
+                        "The terrain here hasn't loaded yet, try again.".to_owned(),
+                    ));
+                },
+                Some(chunk) if chunk.meta().site().is_some() => {
+                    return Err(Content::Plain(
+                        "You can't claim a plot inside a settlement or dungeon.".to_owned(),
+                    ));
+                },
+                Some(_) => {},
+            }
+            let area = plots::plot_area(chunk_key, pos.0.z.floor() as i32, height);
+            {
+                let ecs = server.state.ecs();
+                plots::check_claim(
+                    owner,
+                    area,
+                    &ecs.read_resource::<AreasContainer<BuildArea>>(),
+                    &ecs.read_resource::<BuildPersistence>(),
+                    max_plots,
+                )
+                .map_err(|error| {
+                    Content::Plain(match error {
+                        plots::ClaimError::TooManyPlots { max: 0 } => {
+                            "Building plots are disabled on this server.".to_owned()
+                        },
+                        plots::ClaimError::TooManyPlots { max } => format!(
+                            "You already own {max} plot(s), the most allowed. Use /plot unclaim \
+                             in one of them first."
+                        ),
+                        plots::ClaimError::Overlaps(other) => {
+                            format!("This plot overlaps the build area {other}.")
+                        },
+                    })
+                })?;
+            }
+            let id = server
+                .state
+                .mut_resource::<AreasContainer<BuildArea>>()
+                .insert(name.clone(), area)
+                .map_err(|_| Content::Plain("This plot has already been claimed.".to_owned()))?;
+            with_build_persistence(server, |b| b.plot_claimed(&name, area, owner));
+            give_build_area(server, target, id);
+            format!(
+                "You claimed plot {name}, from {} to {}. Use /build to toggle build mode.",
+                area.min, area.max
+            )
+        },
+        "unclaim" => {
+            let id = own_plot_here(server)?;
+            server
+                .state
+                .mut_resource::<AreasContainer<BuildArea>>()
+                .remove(&name)
+                .map_err(|_| Content::Plain("You are not standing in a plot.".to_owned()))?;
+            with_build_persistence(server, |b| b.area_removed(&name));
+            let builders = (
+                &server.state.ecs().entities(),
+                &server.state.ecs().read_storage::<comp::CanBuild>(),
+            )
+                .join()
+                .filter(|(_, can_build)| can_build.build_areas.contains(&id))
+                .map(|(entity, _)| entity)
+                .collect::<Vec<_>>();
+            for entity in builders {
+                take_build_area(server, entity, id);
+            }
+            format!("You gave up plot {name}. Anything built there is kept.")
+        },
+        "list" => {
+            let plots = {
+                let build_persistence = server.state.ecs().read_resource::<BuildPersistence>();
+                build_persistence
+                    .plots_owned_by(owner)
+                    .map(|plot| {
+                        let trusted = build_persistence.trusted_players(plot).collect::<Vec<_>>();
+                        (plot.to_owned(), trusted)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if plots.is_empty() {
+                "You don't own any plots. Use /plot claim to claim the one you are standing in."
+                    .to_owned()
+            } else {
+                let mut msg = "Your plots:".to_owned();
+                for (plot, trusted) in plots {
+                    let trusted = trusted
+                        .into_iter()
+                        .map(|uuid| {
+                            uuid_to_username(server, target, uuid)
+                                .unwrap_or_else(|_| uuid.to_string())
+                        })
+                        .collect::<Vec<_>>();
+                    if trusted.is_empty() {
+                        let _ = write!(msg, "\n{plot}");
+                    } else {
+                        let _ = write!(msg, "\n{plot}, trusted: {}", trusted.join(", "));
+                    }
+                }
+                msg
+            }
+        },
+        "trust" | "untrust" => {
+            let player_name = player_name.ok_or_else(|| action.help_content())?;
+            let id = own_plot_here(server)?;
+            let (other_entity, other) = match find_alias(server.state.ecs(), &player_name, true) {
+                Ok((entity, uuid)) => (Some(entity), uuid),
+                Err(_) => (None, find_username(server, &player_name)?),
+            };
+            if other == owner {
+                return Err(Content::Plain("You own this plot.".to_owned()));
+            }
+            if plot_action == "trust" {
+                with_build_persistence(server, |b| b.permit_added(other, &name));
+                if let Some(entity) = other_entity {
+                    give_build_area(server, entity, id);
+                    server.notify_client(
+                        entity,
+                        ServerGeneral::server_msg(
+                            ChatType::CommandInfo,
+                            Content::Plain(format!(
+                                "You may now build in plot {name}. Use /build to toggle build \
+                                 mode."
+                            )),
+                        ),
+                    );
+                }
+                format!("{player_name} may now build in plot {name}.")
+            } else {
+                with_build_persistence(server, |b| b.permit_removed(other, &name));
+                if let Some(entity) = other_entity {
+                    take_build_area(server, entity, id);
+                }
+                format!("{player_name} may no longer build in plot {name}.")
+            }
+        },
+        _ => return Err(action.help_content()),
+    };
+    server.notify_client(
+        client,
+        ServerGeneral::server_msg(ChatType::CommandInfo, Content::Plain(msg)),
+    );
+    Ok(())
+}
+
+/// Let `entity` build in a build area.
+fn give_build_area(server: &Server, entity: EcsEntity, id: depot::Id<Aabb<i32>>) {
+    if let Ok(entry) = server
+        .state
+        .ecs()
+        .write_storage::<comp::CanBuild>()
+        .entry(entity)
+    {
+        entry
+            .or_insert(comp::CanBuild {
+                enabled: false,
+                build_areas: HashSet::new(),
+            })
+            .build_areas
+            .insert(id);
+    }
+}
+
+/// Stop `entity` building in a build area.
+fn take_build_area(server: &Server, entity: EcsEntity, id: depot::Id<Aabb<i32>>) {
+    if let Some(mut can_build) = server
+        .state
+        .ecs()
+        .write_storage::<comp::CanBuild>()
+        .get_mut(entity)
+    {
+        can_build.build_areas.remove(&id);
+    }
 }
 
 fn handle_players(

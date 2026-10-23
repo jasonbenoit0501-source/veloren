@@ -105,13 +105,28 @@ pub struct GameplaySettings {
     #[serde(default)]
     // explosion_burn_marks by players
     pub explosion_burn_marks: bool,
+    /// How many building plots each player may claim with `/plot claim`.
+    /// Plots are only available with terrain persistence enabled; 0 disables
+    /// them.
+    #[serde(default = "default_max_plots_per_player")]
+    pub max_plots_per_player: u32,
+    /// The height in blocks of a building plot. A quarter of it is below the
+    /// position the plot was claimed from.
+    #[serde(default = "default_plot_height")]
+    pub plot_height: u32,
 }
+
+fn default_max_plots_per_player() -> u32 { 2 }
+
+fn default_plot_height() -> u32 { 128 }
 
 impl Default for GameplaySettings {
     fn default() -> Self {
         Self {
             battle_mode: ServerBattleMode::default(),
             explosion_burn_marks: true,
+            max_plots_per_player: default_max_plots_per_player(),
+            plot_height: default_plot_height(),
         }
     }
 }

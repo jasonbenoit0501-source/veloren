@@ -4,7 +4,8 @@
 //! given for them (`/permit_build`) normally only live in memory. When terrain
 //! persistence is enabled, this keeps a copy of them in
 //! [`BUILD_AREAS_FILENAME`], restoring areas when the server starts and
-//! permissions when a player logs in.
+//! permissions when a player logs in. The owners of player-claimed plots (see
+//! [`crate::plots`]) are kept here too.
 
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use authc::Uuid;
@@ -53,6 +54,9 @@ struct SavedBuildData {
     areas: BTreeMap<String, SavedArea>,
     /// The names of the build areas each player may build in.
     permits: BTreeMap<Uuid, BTreeSet<String>>,
+    /// The owner of each build area that is a player-claimed plot.
+    #[serde(default)]
+    plots: BTreeMap<String, Uuid>,
 }
 
 pub struct BuildPersistence {
@@ -146,11 +150,46 @@ impl BuildPersistence {
     /// Forget an area along with every permission to build in it.
     pub fn area_removed(&mut self, name: &str) {
         self.data.areas.remove(name);
+        self.data.plots.remove(name);
         for names in self.data.permits.values_mut() {
             names.remove(name);
         }
         self.data.permits.retain(|_, names| !names.is_empty());
         self.save();
+    }
+
+    /// Record a new plot, owned by and buildable by `owner`.
+    pub fn plot_claimed(&mut self, name: &str, area: Aabb<i32>, owner: Uuid) {
+        self.data.areas.insert(name.to_owned(), area.into());
+        self.data.plots.insert(name.to_owned(), owner);
+        self.data
+            .permits
+            .entry(owner)
+            .or_default()
+            .insert(name.to_owned());
+        self.save();
+    }
+
+    /// The owner of the plot with this area name, if it is a plot.
+    pub fn plot_owner(&self, name: &str) -> Option<Uuid> { self.data.plots.get(name).copied() }
+
+    /// The names of the plots owned by this player.
+    pub fn plots_owned_by(&self, owner: Uuid) -> impl Iterator<Item = &str> {
+        self.data
+            .plots
+            .iter()
+            .filter(move |(_, o)| **o == owner)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Players other than the owner who may build in this area.
+    pub fn trusted_players(&self, name: &str) -> impl Iterator<Item = Uuid> {
+        let owner = self.plot_owner(name);
+        self.data
+            .permits
+            .iter()
+            .filter(move |(uuid, names)| Some(**uuid) != owner && names.contains(name))
+            .map(|(uuid, _)| *uuid)
     }
 
     pub fn permit_added(&mut self, uuid: Uuid, area_name: &str) {
@@ -331,6 +370,22 @@ mod tests {
         persistence.area_added("base", area());
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "not ron {");
         assert!(path.is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_without_plots_still_load() {
+        let dir = test_dir("old_format");
+        std::fs::write(
+            dir.join(BUILD_AREAS_FILENAME),
+            r#"(areas: {"base": (min: (0, 0, 0), max: (1, 1, 1))}, permits: {})"#,
+        )
+        .unwrap();
+        let persistence = BuildPersistence::load(&dir);
+        assert!(persistence.can_save);
+        assert_eq!(persistence.data.areas.len(), 1);
+        assert!(persistence.data.plots.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

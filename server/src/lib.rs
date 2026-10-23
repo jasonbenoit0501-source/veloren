@@ -25,6 +25,7 @@ pub mod login_provider;
 pub mod metrics;
 pub mod persistence;
 mod pet;
+pub mod plots;
 pub mod presence;
 pub mod rtsim;
 pub mod settings;
