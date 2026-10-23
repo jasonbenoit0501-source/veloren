@@ -1,8 +1,8 @@
 use std::{f32::consts::PI, ops::Mul};
 
 use common::{comp::loot_owner::ONWERSHIP_TIMEOUT_FAST, rtsim::DialogueKind};
-use common_state::{BlockChange, ScheduledBlockChange};
-use specs::{DispatcherBuilder, Join, ReadExpect, ReadStorage, WriteExpect, WriteStorage};
+use common_state::{AreasContainer, BlockChange, BuildArea, ScheduledBlockChange};
+use specs::{DispatcherBuilder, Join, Read, ReadExpect, ReadStorage, WriteExpect, WriteStorage};
 use tracing::error;
 use vek::*;
 
@@ -32,7 +32,9 @@ use common::{
     vol::ReadVol,
 };
 
-use crate::{Server, ServerGeneral, Time, client::Client};
+use crate::{
+    Server, ServerGeneral, Time, build_persistence::BuildPersistence, client::Client, plots,
+};
 
 use crate::pet::tame_pet;
 use hashbrown::{HashMap, HashSet};
@@ -292,6 +294,9 @@ impl ServerEvent for MineBlockEvent {
         ReadExpect<'a, Time>,
         WriteStorage<'a, comp::SkillSet>,
         ReadStorage<'a, Uid>,
+        Option<Read<'a, BuildPersistence>>,
+        Read<'a, AreasContainer<BuildArea>>,
+        ReadStorage<'a, comp::CanBuild>,
     );
 
     fn handle(
@@ -308,6 +313,9 @@ impl ServerEvent for MineBlockEvent {
             time,
             mut skill_sets,
             uids,
+            build_persistence,
+            build_areas,
+            can_build,
         ): Self::SystemData<'_>,
     ) {
         use rand::RngExt;
@@ -316,7 +324,16 @@ impl ServerEvent for MineBlockEvent {
         let mut sound_event_emitter = sound_events.emitter();
         let mut outcome_emitter = outcomes.emitter();
         for ev in events {
-            if block_change.can_set_block(ev.pos) {
+            // Only the owner of a plot, and those they trust, may mine in it
+            let protected = build_persistence.as_ref().is_some_and(|build_persistence| {
+                plots::is_protected(
+                    ev.pos,
+                    can_build.get(ev.entity),
+                    &build_areas,
+                    build_persistence,
+                )
+            });
+            if !protected && block_change.can_set_block(ev.pos) {
                 let block = terrain.get(ev.pos).ok().copied();
                 if let Some(mut block) =
                     block.filter(|b| b.mine_tool().is_some_and(|t| Some(t) == ev.tool))

@@ -2908,6 +2908,19 @@ fn handle_plot(
                 Some(_) => {},
             }
             let area = plots::plot_area(chunk_key, pos.0.z.floor() as i32, height);
+            #[cfg(feature = "worldgen")]
+            if plots::overlaps_site(
+                area,
+                server
+                    .index
+                    .sites
+                    .values()
+                    .map(|site| (site.origin, site.radius())),
+            ) {
+                return Err(Content::Plain(
+                    "This plot is too close to a settlement or dungeon.".to_owned(),
+                ));
+            }
             {
                 let ecs = server.state.ecs();
                 plots::check_claim(

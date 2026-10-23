@@ -2,6 +2,7 @@
 use crate::rtsim::RtSim;
 use crate::{
     Server, Settings, SpawnPoint,
+    build_persistence::BuildPersistence,
     client::Client,
     comp::{
         BuffKind, BuffSource, PhysicsState,
@@ -14,6 +15,7 @@ use crate::{
     metrics::GameplayMetrics,
     persistence::character_updater::CharacterUpdater,
     pet::tame_pet,
+    plots,
     state_ext::StateExt,
     sys::terrain::{NpcData, SAFE_ZONE_RADIUS, SpawnEntityData},
 };
@@ -67,7 +69,9 @@ use common::{
     vol::ReadVol,
 };
 use common_net::{msg::ServerGeneral, sync::WorldSyncExt, synced_components::Heads};
-use common_state::{AreasContainer, BlockChange, NoDurabilityArea, ScheduledBlockChange};
+use common_state::{
+    AreasContainer, BlockChange, BuildArea, NoDurabilityArea, ScheduledBlockChange,
+};
 use hashbrown::HashSet;
 use rand::RngExt;
 use specs::{
@@ -1591,6 +1595,9 @@ pub struct ExplosionData<'a> {
     physics_states: ReadStorage<'a, PhysicsState>,
     uids: ReadStorage<'a, Uid>,
     masses: ReadStorage<'a, comp::Mass>,
+    build_persistence: Option<Read<'a, BuildPersistence>>,
+    build_areas: Read<'a, AreasContainer<BuildArea>>,
+    can_build: ReadStorage<'a, comp::CanBuild>,
 }
 
 impl ServerEvent for ExplosionEvent {
@@ -1605,6 +1612,19 @@ impl ServerEvent for ExplosionEvent {
 
         for ev in events {
             let owner_entity = ev.owner.and_then(|uid| data.id_maps.uid_entity(uid));
+            // Explosions may not change blocks inside plots their owner can't build in
+            let is_plot_protected = |pos: Vec3<i32>| {
+                data.build_persistence
+                    .as_ref()
+                    .is_some_and(|build_persistence| {
+                        plots::is_protected(
+                            pos,
+                            owner_entity.and_then(|owner| data.can_build.get(owner)),
+                            &data.build_areas,
+                            build_persistence,
+                        )
+                    })
+            };
 
             let explosion_volume = 6.25 * ev.explosion.radius;
 
@@ -1716,6 +1736,9 @@ impl ServerEvent for ExplosionEvent {
                         }
 
                         for block_pos in touched_blocks {
+                            if is_plot_protected(block_pos) {
+                                continue;
+                            }
                             if let Ok(block) = data.terrain.get(block_pos) {
                                 if !matches!(block.kind(), BlockKind::Lava | BlockKind::GlowingRock)
                                     && (
@@ -1790,7 +1813,7 @@ impl ServerEvent for ExplosionEvent {
                                         || ray_energy <= 0.0
                                 })
                                 .for_each(|block: &Block, pos| {
-                                    if block.explode_power().is_some() {
+                                    if block.explode_power().is_some() && !is_plot_protected(pos) {
                                         data.block_change.set(pos, block.into_vacant());
                                     }
                                 })
@@ -1860,6 +1883,9 @@ impl ServerEvent for ExplosionEvent {
                         }
 
                         for block_pos in touched_blocks {
+                            if is_plot_protected(block_pos) {
+                                continue;
+                            }
                             if let Ok(block) = data.terrain.get(block_pos) {
                                 match terrain_replacement_preset {
                                     TerrainReplacementPreset::Lava {

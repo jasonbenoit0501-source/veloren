@@ -170,6 +170,9 @@ impl BuildPersistence {
         self.save();
     }
 
+    /// Whether any plots have been claimed.
+    pub fn has_plots(&self) -> bool { !self.data.plots.is_empty() }
+
     /// The owner of the plot with this area name, if it is a plot.
     pub fn plot_owner(&self, name: &str) -> Option<Uuid> { self.data.plots.get(name).copied() }
 
