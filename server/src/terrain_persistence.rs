@@ -476,3 +476,128 @@ mod version {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::{
+        terrain::{BlockKind, TerrainChunkMeta},
+        vol::ReadVol,
+    };
+
+    /// A fresh, empty persistence directory unique to this test.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "veloren-terrain-persistence-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn wood() -> Block { Block::new(BlockKind::Wood, Rgb::new(120, 80, 40)) }
+
+    fn rock() -> Block { Block::new(BlockKind::Rock, Rgb::new(100, 100, 100)) }
+
+    fn generated_chunk() -> TerrainChunk {
+        TerrainChunk::new(0, rock(), Block::empty(), TerrainChunkMeta::void())
+    }
+
+    #[test]
+    fn placed_blocks_survive_reload() {
+        let dir = test_dir("reload");
+        let positive = Vec3::new(5, 6, 7);
+        let negative = Vec3::new(-1, -1, 10);
+        {
+            let mut persistence = TerrainPersistence::new(dir.clone());
+            persistence.set_block(positive, wood());
+            persistence.set_block(negative, Block::empty());
+            // Dropping writes all modified chunks to disk
+        }
+        assert!(dir.join("terrain/chunk_0_0.dat").is_file());
+        assert!(dir.join("terrain/chunk_-1_-1.dat").is_file());
+
+        let mut persistence = TerrainPersistence::new(dir.clone());
+        let blocks = persistence
+            .load_chunk(Vec2::new(0, 0))
+            .chunk
+            .blocks()
+            .collect::<Vec<_>>();
+        assert_eq!(blocks, vec![(positive, wood())]);
+        let blocks = persistence
+            .load_chunk(Vec2::new(-1, -1))
+            .chunk
+            .blocks()
+            .collect::<Vec<_>>();
+        assert_eq!(blocks, vec![(Vec3::new(31, 31, 10), Block::empty())]);
+
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_changes_overlays_generated_chunk() {
+        let dir = test_dir("apply");
+        let mut persistence = TerrainPersistence::new(dir.clone());
+        persistence.set_block(Vec3::new(3, 4, 5), wood());
+        persistence.set_block(Vec3::new(3, 4, -5), Block::empty());
+
+        let mut chunk = generated_chunk();
+        persistence.apply_changes(Vec2::new(0, 0), &mut chunk);
+        assert_eq!(chunk.get(Vec3::new(3, 4, 5)).ok().copied(), Some(wood()));
+        assert_eq!(
+            chunk.get(Vec3::new(3, 4, -5)).ok().copied(),
+            Some(Block::empty())
+        );
+        // Untouched blocks keep their generated value
+        assert_eq!(
+            chunk.get(Vec3::new(0, 0, 5)).ok().copied(),
+            Some(Block::empty())
+        );
+        assert_eq!(chunk.get(Vec3::new(0, 0, -5)).ok().copied(), Some(rock()));
+
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchanged_blocks_are_forgotten() {
+        let dir = test_dir("forget");
+        let mut persistence = TerrainPersistence::new(dir.clone());
+        // Same as what worldgen produces, so there is nothing to persist
+        persistence.set_block(Vec3::new(1, 1, 1), Block::empty());
+        persistence.apply_changes(Vec2::new(0, 0), &mut generated_chunk());
+        persistence.unload_all();
+        assert!(!dir.join("terrain/chunk_0_0.dat").exists());
+
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_chunk_file_is_backed_up() {
+        let dir = test_dir("corrupt");
+        let mut persistence = TerrainPersistence::new(dir.clone());
+        let path = dir.join("terrain/chunk_0_0.dat");
+        std::fs::write(&path, b"not a chunk").unwrap();
+
+        assert_eq!(persistence.load_chunk(Vec2::new(0, 0)).chunk.len(), 0);
+        assert!(!path.exists());
+        assert!(dir.join("terrain/chunk_0_0.dat_backup_0").is_file());
+
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_format_round_trips() {
+        let mut chunk = Chunk::default();
+        chunk.blocks.insert(Vec3::new(0, 31, -100), wood());
+        chunk.blocks.insert(Vec3::new(31, 0, 200), Block::empty());
+        let bytes =
+            encode_to_vec::<version::Current, _>(chunk.clone().prepare_raw(), legacy()).unwrap();
+        let loaded = Chunk::deserialize_from(io::Cursor::new(bytes)).unwrap();
+        assert_eq!(loaded.blocks, chunk.blocks);
+    }
+}
